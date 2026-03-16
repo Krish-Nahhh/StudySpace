@@ -21,6 +21,11 @@ const io = socketio(server, { cors: { origin: "*" } });
 
 app.use(cors());
 app.use(express.json({ limit: "15mb" }));
+
+app.get("/", (req, res) => {
+  res.send("StudySpace backend running");
+});
+
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use("/api/resources", resourceRoutes);
 
@@ -71,7 +76,7 @@ io.on('connection', (socket) => {
 });
 
 // SERVER
-const PORT = 3001; // FINAL BACKEND PORT
+const PORT = process.env.PORT || 3001; // FINAL BACKEND PORT
 const MONGO = process.env.MONGO_URI ;
 
 mongoose.connect(MONGO)
