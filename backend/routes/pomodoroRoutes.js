@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const Pomodoro = require("../models/pomodoro");
+const Pomodoro = require("../models/temp");
 
 router.get("/:user", async (req, res) => {
   try {
