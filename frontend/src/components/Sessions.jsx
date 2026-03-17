@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import './Sessions.css';
 
-const API = process.env.REACT_APP_API || 'https://studyspace-q5gn.onrender.com/';
+const API = process.env.REACT_APP_API || 'https://studyspace-q5gn.onrender.com';
 
 export default function Sessions() {
   const [sessions, setSessions] = useState([]);
