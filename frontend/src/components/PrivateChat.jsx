@@ -17,37 +17,43 @@ export default function PrivateChat({ otherUser, onClose }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [typing, setTyping] = useState(false);
-  const [showEmojiMenu, setShowEmojiMenu] = useState(false);
 
   const socketRef = useRef(null);
   const typingTimeout = useRef(null);
+  const endRef = useRef(null);
 
   const me = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
 
-  const EMOJIS = ["👍", "❤️", "😂", "🎉", "🔥", "😮", "😢", "🙏"];
-
   useEffect(() => {
-    if (!me?._id || !otherUser?._id) return;
+    if (!me?._id || !otherUser?._id || !token) return;
+
+    // ✅ prevent multiple sockets
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
 
     const s = createSocket(token);
     socketRef.current = s;
 
     const room = dmRoom(me._id, otherUser._id);
 
-    // DEBUG
-    s.on("connect", () => {
-      console.log("✅ SOCKET CONNECTED:", s.id);
-    });
-
-    s.on("connect_error", (err) => {
-      console.error("❌ SOCKET ERROR:", err);
-    });
-
     s.connect();
 
-    // join room
-    s.emit("joinRoom", { roomId: room });
+    // ✅ join AFTER connect
+    s.on("connect", () => {
+      s.emit("joinRoom", { roomId: room });
+    });
+
+    // ✅ handle auth errors
+    s.on("connect_error", (err) => {
+      console.error("Socket auth error:", err.message);
+    });
+
+    // ✅ rejoin on reconnect
+    s.on("reconnect", () => {
+      s.emit("joinRoom", { roomId: room });
+    });
 
     // load history
     axios
@@ -60,7 +66,10 @@ export default function PrivateChat({ otherUser, onClose }) {
     // listeners
     s.on("message", (m) => {
       if (m.room === room) {
-        setMessages((prev) => [...prev, m]);
+        setMessages((prev) => {
+          if (prev.some((x) => x._id === m._id)) return prev;
+          return [...prev, m];
+        });
       }
     });
 
@@ -94,7 +103,12 @@ export default function PrivateChat({ otherUser, onClose }) {
         s.disconnect();
       } catch {}
     };
-  }, [otherUser._id]);
+  }, [otherUser?._id, token]);
+
+  // ✅ auto scroll
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // typing indicator
   const sendTyping = (isTyping) => {
@@ -134,8 +148,10 @@ export default function PrivateChat({ otherUser, onClose }) {
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
-      // ✅ fallback UI update (IMPORTANT)
-      setMessages((prev) => [...prev, res.data]);
+      setMessages((prev) => {
+        if (prev.some((x) => x._id === res.data._id)) return prev;
+        return [...prev, res.data];
+      });
 
       setText("");
       sendTyping(false);
@@ -181,10 +197,7 @@ export default function PrivateChat({ otherUser, onClose }) {
               <div
                 key={m._id || m.createdAt}
                 className={`msg ${
-                  m.from &&
-                  m.from._id === me._id
-                    ? "me"
-                    : ""
+                  m.from && m.from._id === me._id ? "me" : ""
                 }`}
               >
                 <div style={{ fontSize: 12, opacity: 0.8 }}>
@@ -207,10 +220,7 @@ export default function PrivateChat({ otherUser, onClose }) {
                   {m.from?._id === me._id && (
                     <button
                       onClick={() => {
-                        const newText = prompt(
-                          "Edit message",
-                          m.text
-                        );
+                        const newText = prompt("Edit message", m.text);
                         if (newText !== null)
                           editMessage(m._id, newText);
                       }}
@@ -221,6 +231,7 @@ export default function PrivateChat({ otherUser, onClose }) {
                 </div>
               </div>
             ))}
+            <div ref={endRef} />
           </div>
 
           <div style={{ minHeight: 20, marginTop: 6 }}>
@@ -234,7 +245,9 @@ export default function PrivateChat({ otherUser, onClose }) {
               placeholder="Type a message..."
             />
 
-            <button onClick={() => send()}>Send</button>
+            <button disabled={!text.trim()} onClick={() => send()}>
+              Send
+            </button>
 
             <button onClick={onClose} style={{ marginLeft: 8 }}>
               Close

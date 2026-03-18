@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
 const socketio = require('socket.io');
+const jwt = require('jsonwebtoken');
 
 // IMPORT ROUTES
 const authRoutes = require('./routes/authRoutes');
@@ -27,34 +28,62 @@ app.get("/", (req, res) => {
 });
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-app.use("/api/resources", resourceRoutes);
-
 
 // make socket available in routes
 app.set("io", io);
 
-//route mounts
+// route mounts
 app.use('/api/auth', authRoutes);
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/resources', resourceRoutes);
-app.use('/api/settings', settingsRoutes);    
-app.use('/api/pomodoro', pomodoroRoutes);    
+app.use('/api/settings', settingsRoutes);
+app.use('/api/pomodoro', pomodoroRoutes);
 app.use('/api/user', userRoutes);
 
-// Socket.IO
+// 🔐 SOCKET AUTH MIDDLEWARE
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error("Unauthorized"));
+
+  try {
+    const secret = process.env.JWT_SECRET || "supersecret";
+    const decoded = jwt.verify(token, secret);
+    socket.user = decoded; // { id, email, name }
+    next();
+  } catch (err) {
+    return next(new Error("Invalid token"));
+  }
+});
+
+// SOCKET.IO
 io.on('connection', (socket) => {
   console.log("Socket connected:", socket.id);
 
-  socket.on('joinRoom', ({ roomId }) => roomId && socket.join(roomId));
-  socket.on('leaveRoom', ({ roomId }) => roomId && socket.leave(roomId));
+  // ✅ auto join personal room
+  if (socket.user?.id) {
+    socket.join(`user:${socket.user.id}`);
+  }
 
-  socket.on("typing", ({ roomId, user, isTyping }) => {
-    if (roomId) socket.to(roomId).emit("typing", { user, isTyping });
+  socket.on('joinRoom', ({ roomId }) => {
+    if (roomId) socket.join(roomId);
   });
 
-  socket.on("editMessage", (msg) => msg.room && io.to(msg.room).emit("messageEdited", msg));
-  socket.on("reactMessage", (msg) => msg.room && io.to(msg.room).emit("messageReacted", msg));
+  socket.on('leaveRoom', ({ roomId }) => {
+    if (roomId) socket.leave(roomId);
+  });
+
+  socket.on("typing", ({ roomId, user, isTyping }) => {
+    if (roomId) socket.to(roomId).emit("typing", { user, isTyping, roomId });
+  });
+
+  socket.on("editMessage", (msg) => {
+    if (msg.room) io.to(msg.room).emit("messageEdited", msg);
+  });
+
+  socket.on("reactMessage", (msg) => {
+    if (msg.room) io.to(msg.room).emit("messageReacted", msg);
+  });
 
   socket.on('disconnect', () => {
     console.log("Socket disconnected:", socket.id);
@@ -62,10 +91,13 @@ io.on('connection', (socket) => {
 });
 
 // SERVER
-const PORT = process.env.PORT || "https://studyspace-q5gn.onrender.com/"; // FINAL BACKEND PORT
-const MONGO = process.env.MONGO_URI ;
+const PORT = process.env.PORT || 5000;
+const MONGO = process.env.MONGO_URI;
 
-mongoose.connect(MONGO)
+mongoose.connect(MONGO, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
   .then(() => {
     console.log("MongoDB connected");
     server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
