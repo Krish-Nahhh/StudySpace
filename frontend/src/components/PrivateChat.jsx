@@ -7,9 +7,10 @@ const API_BASE =
   process.env.REACT_APP_API_BASE ||
   "https://studyspace-q5gn.onrender.com";
 
-// STRICT room function (ONLY _id)
+// ✅ SAFE room function (force strings + guard)
 function dmRoom(a, b) {
-  const [x, y] = [a.toString(), b.toString()].sort();
+  if (!a || !b) return null;
+  const [x, y] = [String(a), String(b)].sort();
   return `dm:${x}:${y}`;
 }
 
@@ -28,6 +29,16 @@ export default function PrivateChat({ otherUser, onClose }) {
   useEffect(() => {
     if (!me?._id || !otherUser?._id || !token) return;
 
+    // ✅ ALWAYS use string IDs (fixes wrong room bug)
+    const myId = String(me._id);
+    const otherId = String(otherUser._id);
+
+    const room = dmRoom(myId, otherId);
+    if (!room) return;
+
+    // ✅ reset messages when switching users (prevents bleed)
+    setMessages([]);
+
     // ✅ prevent multiple sockets
     if (socketRef.current) {
       socketRef.current.disconnect();
@@ -36,31 +47,32 @@ export default function PrivateChat({ otherUser, onClose }) {
     const s = createSocket(token);
     socketRef.current = s;
 
-    const room = dmRoom(me._id, otherUser._id);
-
     s.connect();
 
-    // ✅ join AFTER connect
+    // join AFTER connect
     s.on("connect", () => {
       s.emit("joinRoom", { roomId: room });
     });
 
-    // ✅ handle auth errors
     s.on("connect_error", (err) => {
       console.error("Socket auth error:", err.message);
     });
 
-    // ✅ rejoin on reconnect
     s.on("reconnect", () => {
       s.emit("joinRoom", { roomId: room });
     });
 
-    // load history
+    // load history (fresh per user)
     axios
-      .get(`${API_BASE}/api/messages/dm/${otherUser._id}`, {
+      .get(`${API_BASE}/api/messages/dm/${otherId}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
-      .then((res) => setMessages(res.data || []))
+      .then((res) => {
+        const filtered = (res.data || []).filter(
+          (m) => m.room === room
+        );
+        setMessages(filtered);
+      })
       .catch(() => setMessages([]));
 
     // listeners
@@ -90,7 +102,7 @@ export default function PrivateChat({ otherUser, onClose }) {
     });
 
     s.on("typing", ({ user, isTyping, roomId }) => {
-      if (roomId === room && user !== me._id) {
+      if (roomId === room && user !== myId) {
         setTyping(isTyping);
       }
     });
@@ -105,7 +117,7 @@ export default function PrivateChat({ otherUser, onClose }) {
     };
   }, [otherUser?._id, token]);
 
-  // ✅ auto scroll
+  // auto scroll
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
@@ -115,11 +127,12 @@ export default function PrivateChat({ otherUser, onClose }) {
     const s = socketRef.current;
     if (!s || !s.connected) return;
 
-    const room = dmRoom(me._id, otherUser._id);
+    const room = dmRoom(String(me._id), String(otherUser._id));
+    if (!room) return;
 
     s.emit("typing", {
       roomId: room,
-      user: me._id,
+      user: String(me._id),
       isTyping,
     });
   };

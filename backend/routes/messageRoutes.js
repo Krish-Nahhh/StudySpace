@@ -4,9 +4,10 @@ const auth = require("../middleware/auth");
 const Message = require("../models/Message");
 const mongoose = require("mongoose");
 
-// consistent DM room (STRICT: only IDs)
+// ✅ SAFE DM room (force string IDs)
 function dmRoom(a, b) {
-  const [x, y] = [a.toString(), b.toString()].sort();
+  if (!a || !b) return null;
+  const [x, y] = [String(a), String(b)].sort();
   return `dm:${x}:${y}`;
 }
 
@@ -19,14 +20,17 @@ async function populateMessage(msgId) {
    GET DM HISTORY
 ========================= */
 router.get("/dm/:otherId", auth, async (req, res) => {
-  const me = req.user.id;
-  const other = req.params.otherId;
+  const me = String(req.user.id);
+  const other = String(req.params.otherId);
 
   if (!mongoose.Types.ObjectId.isValid(other)) {
     return res.status(400).json({ message: "Invalid user" });
   }
 
   const room = dmRoom(me, other);
+  if (!room) {
+    return res.status(400).json({ message: "Invalid room" });
+  }
 
   try {
     const msgs = await Message.find({ room })
@@ -44,8 +48,8 @@ router.get("/dm/:otherId", auth, async (req, res) => {
    POST DM MESSAGE
 ========================= */
 router.post("/dm/:otherId", auth, async (req, res) => {
-  const me = req.user.id;
-  const other = req.params.otherId;
+  const me = String(req.user.id);
+  const other = String(req.params.otherId);
   const { text = "", attachments = [] } = req.body;
 
   if (!mongoose.Types.ObjectId.isValid(other)) {
@@ -57,6 +61,9 @@ router.post("/dm/:otherId", auth, async (req, res) => {
   }
 
   const room = dmRoom(me, other);
+  if (!room) {
+    return res.status(400).json({ message: "Invalid room" });
+  }
 
   try {
     const message = await Message.create({
@@ -70,12 +77,9 @@ router.post("/dm/:otherId", auth, async (req, res) => {
 
     const full = await populateMessage(message._id);
 
-    // 🔥 emit via socket
     const io = req.app.get("io");
     if (io) {
       io.to(room).emit("message", full);
-    } else {
-      console.warn("⚠️ IO not found (socket not attached)");
     }
 
     res.json(full);
@@ -122,7 +126,7 @@ router.post("/session/:sessionId", auth, async (req, res) => {
     const message = await Message.create({
       type: "session",
       room,
-      from: req.user.id,
+      from: String(req.user.id),
       session: sessionId,
       text,
       attachments,
@@ -157,7 +161,7 @@ router.put("/edit/:msgId", auth, async (req, res) => {
     const m = await Message.findById(msgId);
     if (!m) return res.status(404).json({ message: "Not found" });
 
-    if (m.from.toString() !== req.user.id) {
+    if (m.from.toString() !== String(req.user.id)) {
       return res.status(403).json({ message: "Forbidden" });
     }
 
@@ -198,7 +202,7 @@ router.post("/react/:msgId", auth, async (req, res) => {
 
     const existingIndex = m.reactions.findIndex(
       (r) =>
-        r.user.toString() === req.user.id &&
+        r.user.toString() === String(req.user.id) &&
         r.emoji === emoji
     );
 
@@ -206,7 +210,7 @@ router.post("/react/:msgId", auth, async (req, res) => {
       m.reactions.splice(existingIndex, 1);
     } else {
       m.reactions.push({
-        user: req.user.id,
+        user: String(req.user.id),
         emoji,
       });
     }
