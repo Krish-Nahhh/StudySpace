@@ -46,25 +46,11 @@ app.use('/api/user', userRoutes);
 io.on('connection', (socket) => {
   console.log("Socket connected:", socket.id);
 
-  socket.on('register', ({ email }) => {
-    if (email) socket.join("user_" + email);
-  });
-
   socket.on('joinRoom', ({ roomId }) => roomId && socket.join(roomId));
   socket.on('leaveRoom', ({ roomId }) => roomId && socket.leave(roomId));
 
   socket.on("typing", ({ roomId, user, isTyping }) => {
     if (roomId) socket.to(roomId).emit("typing", { user, isTyping });
-  });
-
-  socket.on('chatMessage', (msg) => {
-    if (msg.chatType === 'group') {
-      io.to(msg.roomId).emit("message", msg);
-    } else if (msg.chatType === 'dm') {
-      msg.participants.forEach(email => {
-        io.to("user_" + email).emit("message", msg);
-      });
-    }
   });
 
   socket.on("editMessage", (msg) => msg.room && io.to(msg.room).emit("messageEdited", msg));
