@@ -62,7 +62,7 @@ io.on('connection', (socket) => {
 });
 
 // SERVER
-const PORT = process.env.PORT || "https://studyspace-q5gn.onrender.com/"; // FINAL BACKEND PORT
+const PORT = process.env.PORT || 5000; // FINAL BACKEND PORT
 const MONGO = process.env.MONGO_URI ;
 
 mongoose.connect(MONGO)
