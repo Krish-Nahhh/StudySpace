@@ -20,12 +20,16 @@ export default function Chatroom() {
   const selectedGroupRef = useRef(null);
   const typingTimeouts = useRef({});
 
-  const me = JSON.parse(localStorage.getItem("user") || "{}");
+  const rawMe = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
+
+  // BUG FIX 1: normalise the user ID once. localStorage may store it as
+  // `_id` or `id` depending on which code path last wrote it.
+  const myId = String(rawMe._id || rawMe.id || "");
+  const myEmail = rawMe.email || "";
 
   const EMOJIS = ["👍", "❤️", "😂", "🎉", "🔥", "😮", "😢", "🙏"];
 
-  //loading groups and users on mount
   useEffect(() => {
     axios
       .get(`${API_BASE}/api/sessions`)
@@ -33,7 +37,9 @@ export default function Chatroom() {
       .catch(() => setGroups([]));
 
     axios
-      .get(`${API_BASE}/api/user`, { headers: { Authorization: `Bearer ${token}` } })
+      .get(`${API_BASE}/api/user`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
       .then((r) => setUsers(r.data || []))
       .catch(() => setUsers([]));
 
@@ -41,26 +47,34 @@ export default function Chatroom() {
     socketRef.current = s;
     s.connect();
 
-    if (me && me.email) s.emit("register", { email: me.email });
+    if (myEmail) s.emit("register", { email: myEmail });
 
     s.on("message", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
-        setSessionMessages((prev) => [...prev, m]);
+        setSessionMessages((prev) => {
+          // deduplicate — socket and HTTP response can both deliver the message
+          if (prev.some((x) => x._id === m._id)) return prev;
+          return [...prev, m];
+        });
       }
     });
 
     s.on("messageEdited", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
-        setSessionMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
+        setSessionMessages((prev) =>
+          prev.map((x) => (x._id === m._id ? m : x))
+        );
       }
     });
 
     s.on("messageReacted", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
-        setSessionMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
+        setSessionMessages((prev) =>
+          prev.map((x) => (x._id === m._id ? m : x))
+        );
       }
     });
 
@@ -75,13 +89,10 @@ export default function Chatroom() {
     });
 
     return () => {
-      try {
-        s.disconnect();
-      } catch (e) {}
+      try { s.disconnect(); } catch {}
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  //loading session messages when selectedGroup changes
   useEffect(() => {
     const s = socketRef.current;
     selectedGroupRef.current = selectedGroup;
@@ -99,30 +110,27 @@ export default function Chatroom() {
       .catch(() => setSessionMessages([]));
 
     const room = `session:${selectedGroup._id}`;
-    if (s && s.connected) s.emit("joinRoom", { roomId: room });
+    if (s?.connected) s.emit("joinRoom", { roomId: room });
 
     return () => {
-      if (s && s.connected) s.emit("leaveRoom", { roomId: room });
+      if (s?.connected) s.emit("leaveRoom", { roomId: room });
       setSessionMessages([]);
       selectedGroupRef.current = null;
     };
-  }, [selectedGroup]);
+  }, [selectedGroup]); // eslint-disable-line react-hooks/exhaustive-deps
 
-//typing indicatorrrr
   const sendTyping = (roomId, isTyping) => {
     const s = socketRef.current;
-    if (!s || !s.connected) return;
-    s.emit("typing", { roomId, user: me.email || me._id, isTyping });
+    if (!s?.connected) return;
+    // use normalised myId so the typing filter on the receiver side matches
+    s.emit("typing", { roomId, user: myEmail || myId, isTyping });
   };
 
   const onSessionTextChange = (e) => {
     setSessionText(e.target.value);
-
     if (!selectedGroup) return;
     const room = `session:${selectedGroup._id}`;
-
     sendTyping(room, true);
-
     if (typingTimeouts.current[room]) clearTimeout(typingTimeouts.current[room]);
     typingTimeouts.current[room] = setTimeout(() => {
       sendTyping(room, false);
@@ -130,13 +138,10 @@ export default function Chatroom() {
     }, 900);
   };
 
-//sending session message
   const sendSessionMsg = async (maybeEmoji) => {
-    if ((!sessionText || !sessionText.trim()) && !maybeEmoji) return;
+    if (!sessionText?.trim() && !maybeEmoji) return;
     if (!selectedGroup) return;
-
-    const bodyText = maybeEmoji ? maybeEmoji : sessionText;
-
+    const bodyText = maybeEmoji ?? sessionText;
     try {
       await axios.post(
         `${API_BASE}/api/messages/session/${selectedGroup._id}`,
@@ -181,31 +186,44 @@ export default function Chatroom() {
     return u ? u.name || u.email : email;
   };
 
+  // BUG FIX 2: the old version compared `m.from._id` against `me._id` which
+  // could be undefined, making `isMsgFromMe` always return false and sending
+  // the wrong CSS class to every session message. Now uses `myId` and `myEmail`
+  // both of which are safely normalised above.
   const isMsgFromMe = (m) => {
-    if (!m || !m.from) return false;
-    const fromEmail = m.from.email || (typeof m.from === "string" ? m.from : null);
-    if (fromEmail && me.email) return fromEmail === me.email;
-    if (m.from._id && (me._id || me.id)) return m.from._id === (me._id || me.id);
+    if (!m?.from) return false;
+    const fromId = String(m.from._id || m.from);
+    const fromEmail = m.from.email;
+    if (fromId && myId) return fromId === myId;
+    if (fromEmail && myEmail) return fromEmail === myEmail;
     return false;
   };
 
   const typingTextForRoom = (room) => {
     const m = typingUsers[room];
     if (!m) return null;
-    const emails = Object.keys(m).filter((e) => e && e !== me.email);
-    if (!emails.length) return null;
-    const names = emails.map((em) => getDisplayNameForEmail(em));
-    return names.length === 1 ? `${names[0]} is typing...` : `Multiple people are typing...`;
+    const keys = Object.keys(m).filter((e) => e && e !== myEmail && e !== myId);
+    if (!keys.length) return null;
+    const names = keys.map((k) => getDisplayNameForEmail(k));
+    return names.length === 1
+      ? `${names[0]} is typing...`
+      : "Multiple people are typing...";
   };
 
-//main render
   return (
     <div className="app-shell chatroom-container">
       <div className="chatroom-shell">
         <div className="left">
           <h3>Sessions</h3>
           {groups.map((g) => (
-            <div key={g._id} className="group" onClick={() => setSelectedGroup(g)}>
+            <div
+              key={g._id}
+              className="group"
+              onClick={() => {
+                setDmUser(null);        // close any open DM when switching to session
+                setSelectedGroup(g);
+              }}
+            >
               {g.title || g.name || g._id}
             </div>
           ))}
@@ -214,9 +232,16 @@ export default function Chatroom() {
 
           <h3>Users</h3>
           {users
-            .filter((u) => u.email !== me.email)
+            .filter((u) => u.email !== myEmail)
             .map((u) => (
-              <div key={u._id} className="group" onClick={() => setDmUser(u)}>
+              <div
+                key={u._id}
+                className="group"
+                onClick={() => {
+                  setSelectedGroup(null);   // close any open session when opening DM
+                  setDmUser(u);
+                }}
+              >
                 {u.name || u.email}
               </div>
             ))}
@@ -232,60 +257,74 @@ export default function Chatroom() {
               <div className="chat-window">
                 {sessionMessages.map((m) => {
                   const amI = isMsgFromMe(m);
-                  const room = `session:${selectedGroup._id}`;
                   return (
-                    <div key={m._id || m.createdAt} className={`msg ${amI ? "me" : ""}`}>
+                    <div
+                      key={m._id || m.createdAt}
+                      className={`msg ${amI ? "me" : ""}`}
+                    >
                       <div style={{ fontSize: 12, opacity: 0.8 }}>
-                        {m.from?.name || m.from?.email} {m.edited ? "(edited)" : ""}
+                        {m.from?.name || m.from?.email}{" "}
+                        {m.edited ? "(edited)" : ""}
                       </div>
 
                       <div>{m.text}</div>
 
-                      {m.attachments &&
-                        m.attachments.map((a, i) => (
-                          <div key={i}>
-                            {a.mime && a.mime.startsWith("image/") ? (
-                              <img src={a.url} alt={a.name} style={{ maxWidth: 200 }} />
-                            ) : (
-                              <a href={a.url} target="_blank" rel="noreferrer">
-                                {a.name || "attachment"}
-                              </a>
-                            )}
-                          </div>
-                        ))}
+                      {m.attachments?.map((a, i) => (
+                        <div key={i}>
+                          {a.mime?.startsWith("image/") ? (
+                            <img
+                              src={a.url}
+                              alt={a.name}
+                              style={{ maxWidth: 200 }}
+                            />
+                          ) : (
+                            <a href={a.url} target="_blank" rel="noreferrer">
+                              {a.name || "attachment"}
+                            </a>
+                          )}
+                        </div>
+                      ))}
 
                       <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        {m.reactions &&
-                          m.reactions.map((r, idx) => (
-                            <span key={idx} style={{ marginRight: 6 }}>
-                              {r.emoji}
-                            </span>
-                          ))}
+                        {m.reactions?.map((r, idx) => (
+                          <span key={idx} style={{ marginRight: 6 }}>
+                            {r.emoji}
+                          </span>
+                        ))}
 
-                        <button onClick={() => reactToMessage(m._id, "👍")}>👍</button>
+                        <button onClick={() => reactToMessage(m._id, "👍")}>
+                          👍
+                        </button>
 
-                        <button onClick={() => setShowEmojiMenuFor(m._id)}>😀</button>
+                        <button onClick={() => setShowEmojiMenuFor(m._id)}>
+                          😀
+                        </button>
 
-                        {isMsgFromMe(m) && (
+                        {amI && (
                           <button
                             onClick={() => {
                               const newText = prompt("Edit message", m.text);
-                              if (newText !== null) editMessage(m._id, newText);
+                              if (newText !== null)
+                                editMessage(m._id, newText);
                             }}
                           >
                             Edit
                           </button>
                         )}
 
-                        {showEmojiMenuFor === m._id ? (
+                        {showEmojiMenuFor === m._id && (
                           <div style={{ display: "inline-block", marginLeft: 8 }}>
                             {EMOJIS.map((e) => (
-                              <button key={e} onClick={() => reactToMessage(m._id, e)} style={{ marginRight: 6 }}>
+                              <button
+                                key={e}
+                                onClick={() => reactToMessage(m._id, e)}
+                                style={{ marginRight: 6 }}
+                              >
                                 {e}
                               </button>
                             ))}
                           </div>
-                        ) : null}
+                        )}
                       </div>
                     </div>
                   );

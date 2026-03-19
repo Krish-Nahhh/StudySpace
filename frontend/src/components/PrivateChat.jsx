@@ -7,7 +7,6 @@ const API_BASE =
   process.env.REACT_APP_API_BASE ||
   "https://studyspace-q5gn.onrender.com";
 
-// ✅ SAFE room function (force strings + guard)
 function dmRoom(a, b) {
   if (!a || !b) return null;
   const [x, y] = [String(a), String(b)].sort();
@@ -18,141 +17,126 @@ export default function PrivateChat({ otherUser, onClose }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [typing, setTyping] = useState(false);
+  const [fetchError, setFetchError] = useState(false);
 
   const socketRef = useRef(null);
   const typingTimeout = useRef(null);
   const endRef = useRef(null);
 
-  const me = JSON.parse(localStorage.getItem("user") || "{}");
+  const rawMe = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
 
+  // BUG FIX 1: localStorage can store either `_id` or `id` depending on
+  // which code path last wrote it. Normalise once and use `myId` everywhere.
+  const myId = String(rawMe._id || rawMe.id || "");
+
   useEffect(() => {
-    if (!me?._id || !otherUser?._id || !token) return;
+    // BUG FIX 2: the old guard checked `me?._id`, which is undefined when
+    // the stored user object uses `id` instead of `_id`. That caused the
+    // entire effect to bail out — no socket, no history fetch, empty chat
+    // on every refresh.
+    if (!myId || !otherUser?._id || !token) return;
 
-    // ✅ ALWAYS use string IDs (fixes wrong room bug)
-    const myId = String(me._id);
     const otherId = String(otherUser._id);
-
     const room = dmRoom(myId, otherId);
     if (!room) return;
 
-    // ✅ reset messages when switching users (prevents bleed)
     setMessages([]);
+    setFetchError(false);
 
-    // ✅ prevent multiple sockets
     if (socketRef.current) {
       socketRef.current.disconnect();
     }
 
     const s = createSocket(token);
     socketRef.current = s;
-
     s.connect();
 
-    // join AFTER connect
-    s.on("connect", () => {
-      s.emit("joinRoom", { roomId: room });
-    });
+    const joinRoom = () => s.emit("joinRoom", { roomId: room });
 
-    s.on("connect_error", (err) => {
-      console.error("Socket auth error:", err.message);
-    });
+    s.on("connect", joinRoom);
+    s.on("connect_error", (err) =>
+      console.error("Socket auth error:", err.message)
+    );
+    s.on("reconnect", joinRoom);
 
-    s.on("reconnect", () => {
-      s.emit("joinRoom", { roomId: room });
-    });
-
-    // load history (fresh per user)
+    // Load history
     axios
       .get(`${API_BASE}/api/messages/dm/${otherId}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
       .then((res) => {
-        const filtered = (res.data || []).filter(
-          (m) => m.room === room
-        );
+        // The API already filters by room, but keep the safety filter.
+        const filtered = (res.data || []).filter((m) => m.room === room);
         setMessages(filtered);
       })
-      .catch(() => setMessages([]));
+      .catch((err) => {
+        console.error("History fetch failed:", err);
+        setFetchError(true);
+        setMessages([]);
+      });
 
-    // listeners
     s.on("message", (m) => {
-      if (m.room === room) {
-        setMessages((prev) => {
-          if (prev.some((x) => x._id === m._id)) return prev;
-          return [...prev, m];
-        });
-      }
+      if (m.room !== room) return;
+      setMessages((prev) => {
+        if (prev.some((x) => x._id === m._id)) return prev;
+        return [...prev, m];
+      });
     });
 
     s.on("messageEdited", (m) => {
       if (m.room === room) {
-        setMessages((prev) =>
-          prev.map((x) => (x._id === m._id ? m : x))
-        );
+        setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
       }
     });
 
     s.on("messageReacted", (m) => {
       if (m.room === room) {
-        setMessages((prev) =>
-          prev.map((x) => (x._id === m._id ? m : x))
-        );
+        setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
       }
     });
 
     s.on("typing", ({ user, isTyping, roomId }) => {
+      // BUG FIX 3: was comparing against `myId` from outer scope which could
+      // have been `undefined`, showing the typing indicator for yourself.
       if (roomId === room && user !== myId) {
         setTyping(isTyping);
       }
     });
 
     return () => {
-      try {
-        s.emit("leaveRoom", { roomId: room });
-      } catch {}
-      try {
-        s.disconnect();
-      } catch {}
+      try { s.emit("leaveRoom", { roomId: room }); } catch {}
+      try { s.disconnect(); } catch {}
     };
-  }, [otherUser?._id, token]);
+  }, [otherUser?._id, token, myId]);
 
-  // auto scroll
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // typing indicator
   const sendTyping = (isTyping) => {
     const s = socketRef.current;
     if (!s || !s.connected) return;
-
-    const room = dmRoom(String(me._id), String(otherUser._id));
+    // BUG FIX 4: was calling `String(me._id)` which could produce the string
+    // "undefined" — use the normalised `myId` instead.
+    const room = dmRoom(myId, String(otherUser._id));
     if (!room) return;
-
-    s.emit("typing", {
-      roomId: room,
-      user: String(me._id),
-      isTyping,
-    });
+    s.emit("typing", { roomId: room, user: myId, isTyping });
   };
 
   const onTextChange = (e) => {
     setText(e.target.value);
     sendTyping(true);
-
     if (typingTimeout.current) clearTimeout(typingTimeout.current);
-
     typingTimeout.current = setTimeout(() => {
       sendTyping(false);
       typingTimeout.current = null;
     }, 900);
   };
 
-  // SEND MESSAGE
   const send = async (maybeEmoji) => {
-    const bodyText = maybeEmoji ? maybeEmoji : text;
-    if (!bodyText || !bodyText.trim()) return;
+    const bodyText = maybeEmoji ?? text;
+    if (!bodyText?.trim()) return;
 
     try {
       const res = await axios.post(
@@ -160,12 +144,10 @@ export default function PrivateChat({ otherUser, onClose }) {
         { text: bodyText },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
       setMessages((prev) => {
         if (prev.some((x) => x._id === res.data._id)) return prev;
         return [...prev, res.data];
       });
-
       setText("");
       sendTyping(false);
     } catch (e) {
@@ -201,49 +183,60 @@ export default function PrivateChat({ otherUser, onClose }) {
     <div className="app-shell chatroom-container" style={{ maxWidth: 900 }}>
       <div className="chatroom-shell" style={{ gridTemplateColumns: "1fr" }}>
         <div className="right">
-          <h3>
-            Chat with {otherUser.name || otherUser.email}
-          </h3>
+          <h3>Chat with {otherUser.name || otherUser.email}</h3>
+
+          {fetchError && (
+            <div style={{ color: "red", marginBottom: 8, fontSize: 13 }}>
+              Could not load message history. Check your connection or try
+              refreshing.
+            </div>
+          )}
 
           <div className="chat-window">
-            {messages.map((m) => (
-              <div
-                key={m._id || m.createdAt}
-                className={`msg ${
-                  m.from && m.from._id === me._id ? "me" : ""
-                }`}
-              >
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  {m.from?.name} {m.edited ? "(edited)" : ""}
-                </div>
+            {messages.map((m) => {
+              // BUG FIX 5: was `m.from._id === me._id` — when `me._id` is
+              // undefined this is always false, so sent messages never get
+              // the "me" bubble style. Use normalised `myId`.
+              const isMe =
+                m.from?._id === myId ||
+                String(m.from?._id) === myId;
 
-                <div>{m.text}</div>
+              return (
+                <div
+                  key={m._id || m.createdAt}
+                  className={`msg ${isMe ? "me" : ""}`}
+                >
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    {m.from?.name} {m.edited ? "(edited)" : ""}
+                  </div>
 
-                <div style={{ fontSize: 12, opacity: 0.7 }}>
-                  {m.reactions?.map((r, i) => (
-                    <span key={i} style={{ marginRight: 6 }}>
-                      {r.emoji}
-                    </span>
-                  ))}
+                  <div>{m.text}</div>
 
-                  <button onClick={() => reactToMessage(m._id, "👍")}>
-                    👍
-                  </button>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>
+                    {m.reactions?.map((r, i) => (
+                      <span key={i} style={{ marginRight: 6 }}>
+                        {r.emoji}
+                      </span>
+                    ))}
 
-                  {m.from?._id === me._id && (
-                    <button
-                      onClick={() => {
-                        const newText = prompt("Edit message", m.text);
-                        if (newText !== null)
-                          editMessage(m._id, newText);
-                      }}
-                    >
-                      Edit
+                    <button onClick={() => reactToMessage(m._id, "👍")}>
+                      👍
                     </button>
-                  )}
+
+                    {isMe && (
+                      <button
+                        onClick={() => {
+                          const newText = prompt("Edit message", m.text);
+                          if (newText !== null) editMessage(m._id, newText);
+                        }}
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
             <div ref={endRef} />
           </div>
 
@@ -257,11 +250,9 @@ export default function PrivateChat({ otherUser, onClose }) {
               onChange={onTextChange}
               placeholder="Type a message..."
             />
-
             <button disabled={!text.trim()} onClick={() => send()}>
               Send
             </button>
-
             <button onClick={onClose} style={{ marginLeft: 8 }}>
               Close
             </button>
