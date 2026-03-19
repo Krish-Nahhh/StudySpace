@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import { getMyId } from "../utils/getmyid";
 import "./Chatroom.css";
 
 const API_BASE =
@@ -12,8 +13,7 @@ function dmRoom(a, b) {
   return `dm:${x}:${y}`;
 }
 
-// socket is passed in from Chatroom — it's the shared, already-connected
-// socket. PrivateChat never creates or destroys it, only joins/leaves rooms.
+// socket is passed in from Chatroom — already connected, never created/destroyed here.
 export default function PrivateChat({ otherUser, socket, onClose }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
@@ -23,12 +23,11 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
   const typingTimeout = useRef(null);
   const endRef = useRef(null);
 
-  const rawMe = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
-  const myId = String(rawMe._id || rawMe.id || "");
+  // THE ROOT FIX: localStorage user has no _id/id — decode it from the JWT instead.
+  const myId = getMyId();
 
   useEffect(() => {
-    // Always clear state immediately when switching users
     setMessages([]);
     setFetchError(false);
 
@@ -38,12 +37,9 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
     const room = dmRoom(myId, otherId);
     if (!room) return;
 
-    // Join the DM room on the shared socket
     socket.emit("joinRoom", { roomId: room });
 
-    // AbortController cancels a slow history fetch if the user switches
-    // chats before it resolves, preventing stale data from overwriting the
-    // newly selected chat's (empty) state.
+    // AbortController cancels stale history fetch if user switches chats
     const abort = new AbortController();
 
     axios
@@ -61,8 +57,7 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
         setFetchError(true);
       });
 
-    // Named handlers so we can remove them exactly on cleanup without
-    // accidentally removing Chatroom's own listeners on the same socket.
+    // Named handlers so socket.off() only removes these, not Chatroom's listeners
     const onMessage = (m) => {
       if (m.room !== room) return;
       setMessages((prev) => {
@@ -70,35 +65,22 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
         return [...prev, m];
       });
     };
+    const onEdited   = (m) => { if (m.room === room) setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x))); };
+    const onReacted  = (m) => { if (m.room === room) setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x))); };
+    const onTyping   = ({ user, isTyping, roomId }) => { if (roomId === room && user !== myId) setTyping(isTyping); };
 
-    const onEdited = (m) => {
-      if (m.room === room)
-        setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
-    };
-
-    const onReacted = (m) => {
-      if (m.room === room)
-        setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
-    };
-
-    const onTyping = ({ user, isTyping, roomId }) => {
-      if (roomId === room && user !== myId) setTyping(isTyping);
-    };
-
-    socket.on("message", onMessage);
+    socket.on("message",       onMessage);
     socket.on("messageEdited", onEdited);
-    socket.on("messageReacted", onReacted);
-    socket.on("typing", onTyping);
+    socket.on("messageReacted",onReacted);
+    socket.on("typing",        onTyping);
 
     return () => {
       abort.abort();
       socket.emit("leaveRoom", { roomId: room });
-      // Remove only the handlers registered here — do NOT disconnect,
-      // the socket belongs to Chatroom.
-      socket.off("message", onMessage);
+      socket.off("message",       onMessage);
       socket.off("messageEdited", onEdited);
-      socket.off("messageReacted", onReacted);
-      socket.off("typing", onTyping);
+      socket.off("messageReacted",onReacted);
+      socket.off("typing",        onTyping);
     };
   }, [otherUser?._id, myId, token, socket]);
 
@@ -117,10 +99,7 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
     setText(e.target.value);
     sendTyping(true);
     if (typingTimeout.current) clearTimeout(typingTimeout.current);
-    typingTimeout.current = setTimeout(() => {
-      sendTyping(false);
-      typingTimeout.current = null;
-    }, 900);
+    typingTimeout.current = setTimeout(() => { sendTyping(false); typingTimeout.current = null; }, 900);
   };
 
   const send = async (maybeEmoji) => {
@@ -138,28 +117,18 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
       });
       setText("");
       sendTyping(false);
-    } catch (e) {
-      console.error("SEND ERROR:", e);
-    }
+    } catch (e) { console.error("SEND ERROR:", e); }
   };
 
   const editMessage = async (msgId, newText) => {
     try {
-      await axios.put(
-        `${API_BASE}/api/messages/edit/${msgId}`,
-        { text: newText },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      await axios.put(`${API_BASE}/api/messages/edit/${msgId}`, { text: newText }, { headers: { Authorization: `Bearer ${token}` } });
     } catch (e) { console.error(e); }
   };
 
   const reactToMessage = async (msgId, emoji) => {
     try {
-      await axios.post(
-        `${API_BASE}/api/messages/react/${msgId}`,
-        { emoji },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      await axios.post(`${API_BASE}/api/messages/react/${msgId}`, { emoji }, { headers: { Authorization: `Bearer ${token}` } });
     } catch (e) { console.error(e); }
   };
 
@@ -190,12 +159,7 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
                     ))}
                     <button onClick={() => reactToMessage(m._id, "👍")}>👍</button>
                     {isMe && (
-                      <button
-                        onClick={() => {
-                          const newText = prompt("Edit message", m.text);
-                          if (newText !== null) editMessage(m._id, newText);
-                        }}
-                      >
+                      <button onClick={() => { const t = prompt("Edit message", m.text); if (t !== null) editMessage(m._id, t); }}>
                         Edit
                       </button>
                     )}
@@ -212,6 +176,8 @@ export default function PrivateChat({ otherUser, socket, onClose }) {
 
           <div className="input-row">
             <input
+              id="dm-input"
+              name="dm-input"
               value={text}
               onChange={onTextChange}
               placeholder="Type a message..."
