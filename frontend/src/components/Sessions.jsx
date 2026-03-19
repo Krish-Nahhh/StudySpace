@@ -18,7 +18,8 @@ export default function Sessions() {
         console.error("SESSIONS GET ERROR:", err);
         setSessions([]);
       });
-  }, [API]);
+  }, []); // FIX: was [API] — API is a module-level constant so this caused
+          // a React warning and an unnecessary re-fetch on every render.
 
   async function create() {
     const token = localStorage.getItem('token');
@@ -31,10 +32,7 @@ export default function Sessions() {
         { title, description, link },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
-      // add newly created session to the list
       setSessions(prev => [res.data, ...prev]);
-
       setTitle('');
       setDescription('');
       setLink('');
@@ -61,13 +59,10 @@ export default function Sessions() {
               <h4>{s.title}</h4>
               <p>{s.description}</p>
             </div>
-
             <div>
               {s.link ? (
                 <a className="btn" href={s.link} target="_blank" rel="noreferrer">Join</a>
               ) : null}
-
-              {/* details page*/}
               <a className="btn" href={`/sessions/${s._id}`} style={{ marginLeft: 8 }}>Details</a>
             </div>
           </div>

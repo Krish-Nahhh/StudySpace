@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
-import { createSocket } from "../socket";
 import "./Chatroom.css";
 
 const API_BASE =
@@ -13,115 +12,105 @@ function dmRoom(a, b) {
   return `dm:${x}:${y}`;
 }
 
-export default function PrivateChat({ otherUser, onClose }) {
+// socket is passed in from Chatroom — it's the shared, already-connected
+// socket. PrivateChat never creates or destroys it, only joins/leaves rooms.
+export default function PrivateChat({ otherUser, socket, onClose }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [typing, setTyping] = useState(false);
   const [fetchError, setFetchError] = useState(false);
 
-  const socketRef = useRef(null);
   const typingTimeout = useRef(null);
   const endRef = useRef(null);
 
   const rawMe = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
-
-  // BUG FIX 1: localStorage can store either `_id` or `id` depending on
-  // which code path last wrote it. Normalise once and use `myId` everywhere.
   const myId = String(rawMe._id || rawMe.id || "");
 
   useEffect(() => {
-    // BUG FIX 2: the old guard checked `me?._id`, which is undefined when
-    // the stored user object uses `id` instead of `_id`. That caused the
-    // entire effect to bail out — no socket, no history fetch, empty chat
-    // on every refresh.
-    if (!myId || !otherUser?._id || !token) return;
+    // Always clear state immediately when switching users
+    setMessages([]);
+    setFetchError(false);
+
+    if (!myId || !otherUser?._id || !token || !socket) return;
 
     const otherId = String(otherUser._id);
     const room = dmRoom(myId, otherId);
     if (!room) return;
 
-    setMessages([]);
-    setFetchError(false);
+    // Join the DM room on the shared socket
+    socket.emit("joinRoom", { roomId: room });
 
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-    }
+    // AbortController cancels a slow history fetch if the user switches
+    // chats before it resolves, preventing stale data from overwriting the
+    // newly selected chat's (empty) state.
+    const abort = new AbortController();
 
-    const s = createSocket(token);
-    socketRef.current = s;
-    s.connect();
-
-    const joinRoom = () => s.emit("joinRoom", { roomId: room });
-
-    s.on("connect", joinRoom);
-    s.on("connect_error", (err) =>
-      console.error("Socket auth error:", err.message)
-    );
-    s.on("reconnect", joinRoom);
-
-    // Load history
     axios
       .get(`${API_BASE}/api/messages/dm/${otherId}`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: abort.signal,
       })
       .then((res) => {
-        // The API already filters by room, but keep the safety filter.
         const filtered = (res.data || []).filter((m) => m.room === room);
         setMessages(filtered);
       })
       .catch((err) => {
-        console.error("History fetch failed:", err);
+        if (axios.isCancel(err) || err.name === "CanceledError") return;
+        console.error("DM history fetch failed:", err);
         setFetchError(true);
-        setMessages([]);
       });
 
-    s.on("message", (m) => {
+    // Named handlers so we can remove them exactly on cleanup without
+    // accidentally removing Chatroom's own listeners on the same socket.
+    const onMessage = (m) => {
       if (m.room !== room) return;
       setMessages((prev) => {
         if (prev.some((x) => x._id === m._id)) return prev;
         return [...prev, m];
       });
-    });
+    };
 
-    s.on("messageEdited", (m) => {
-      if (m.room === room) {
+    const onEdited = (m) => {
+      if (m.room === room)
         setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
-      }
-    });
+    };
 
-    s.on("messageReacted", (m) => {
-      if (m.room === room) {
+    const onReacted = (m) => {
+      if (m.room === room)
         setMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
-      }
-    });
+    };
 
-    s.on("typing", ({ user, isTyping, roomId }) => {
-      // BUG FIX 3: was comparing against `myId` from outer scope which could
-      // have been `undefined`, showing the typing indicator for yourself.
-      if (roomId === room && user !== myId) {
-        setTyping(isTyping);
-      }
-    });
+    const onTyping = ({ user, isTyping, roomId }) => {
+      if (roomId === room && user !== myId) setTyping(isTyping);
+    };
+
+    socket.on("message", onMessage);
+    socket.on("messageEdited", onEdited);
+    socket.on("messageReacted", onReacted);
+    socket.on("typing", onTyping);
 
     return () => {
-      try { s.emit("leaveRoom", { roomId: room }); } catch {}
-      try { s.disconnect(); } catch {}
+      abort.abort();
+      socket.emit("leaveRoom", { roomId: room });
+      // Remove only the handlers registered here — do NOT disconnect,
+      // the socket belongs to Chatroom.
+      socket.off("message", onMessage);
+      socket.off("messageEdited", onEdited);
+      socket.off("messageReacted", onReacted);
+      socket.off("typing", onTyping);
     };
-  }, [otherUser?._id, token, myId]);
+  }, [otherUser?._id, myId, token, socket]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   const sendTyping = (isTyping) => {
-    const s = socketRef.current;
-    if (!s || !s.connected) return;
-    // BUG FIX 4: was calling `String(me._id)` which could produce the string
-    // "undefined" — use the normalised `myId` instead.
+    if (!socket?.connected) return;
     const room = dmRoom(myId, String(otherUser._id));
     if (!room) return;
-    s.emit("typing", { roomId: room, user: myId, isTyping });
+    socket.emit("typing", { roomId: room, user: myId, isTyping });
   };
 
   const onTextChange = (e) => {
@@ -137,7 +126,6 @@ export default function PrivateChat({ otherUser, onClose }) {
   const send = async (maybeEmoji) => {
     const bodyText = maybeEmoji ?? text;
     if (!bodyText?.trim()) return;
-
     try {
       const res = await axios.post(
         `${API_BASE}/api/messages/dm/${otherUser._id}`,
@@ -162,9 +150,7 @@ export default function PrivateChat({ otherUser, onClose }) {
         { text: newText },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
 
   const reactToMessage = async (msgId, emoji) => {
@@ -174,9 +160,7 @@ export default function PrivateChat({ otherUser, onClose }) {
         { emoji },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
 
   return (
@@ -187,42 +171,24 @@ export default function PrivateChat({ otherUser, onClose }) {
 
           {fetchError && (
             <div style={{ color: "red", marginBottom: 8, fontSize: 13 }}>
-              Could not load message history. Check your connection or try
-              refreshing.
+              Could not load message history. Check your connection or try refreshing.
             </div>
           )}
 
           <div className="chat-window">
             {messages.map((m) => {
-              // BUG FIX 5: was `m.from._id === me._id` — when `me._id` is
-              // undefined this is always false, so sent messages never get
-              // the "me" bubble style. Use normalised `myId`.
-              const isMe =
-                m.from?._id === myId ||
-                String(m.from?._id) === myId;
-
+              const isMe = String(m.from?._id) === myId;
               return (
-                <div
-                  key={m._id || m.createdAt}
-                  className={`msg ${isMe ? "me" : ""}`}
-                >
+                <div key={m._id || m.createdAt} className={`msg ${isMe ? "me" : ""}`}>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>
                     {m.from?.name} {m.edited ? "(edited)" : ""}
                   </div>
-
                   <div>{m.text}</div>
-
                   <div style={{ fontSize: 12, opacity: 0.7 }}>
                     {m.reactions?.map((r, i) => (
-                      <span key={i} style={{ marginRight: 6 }}>
-                        {r.emoji}
-                      </span>
+                      <span key={i} style={{ marginRight: 6 }}>{r.emoji}</span>
                     ))}
-
-                    <button onClick={() => reactToMessage(m._id, "👍")}>
-                      👍
-                    </button>
-
+                    <button onClick={() => reactToMessage(m._id, "👍")}>👍</button>
                     {isMe && (
                       <button
                         onClick={() => {
@@ -250,12 +216,8 @@ export default function PrivateChat({ otherUser, onClose }) {
               onChange={onTextChange}
               placeholder="Type a message..."
             />
-            <button disabled={!text.trim()} onClick={() => send()}>
-              Send
-            </button>
-            <button onClick={onClose} style={{ marginLeft: 8 }}>
-              Close
-            </button>
+            <button disabled={!text.trim()} onClick={() => send()}>Send</button>
+            <button onClick={onClose} style={{ marginLeft: 8 }}>Close</button>
           </div>
         </div>
       </div>

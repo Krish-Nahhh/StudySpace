@@ -15,6 +15,9 @@ export default function Chatroom() {
   const [sessionText, setSessionText] = useState("");
   const [typingUsers, setTypingUsers] = useState({});
   const [showEmojiMenuFor, setShowEmojiMenuFor] = useState(null);
+  // Track whether the shared socket is connected so PrivateChat
+  // doesn't mount before the socket is ready
+  const [socketReady, setSocketReady] = useState(false);
 
   const socketRef = useRef(null);
   const selectedGroupRef = useRef(null);
@@ -22,14 +25,12 @@ export default function Chatroom() {
 
   const rawMe = JSON.parse(localStorage.getItem("user") || "{}");
   const token = localStorage.getItem("token");
-
-  // BUG FIX 1: normalise the user ID once. localStorage may store it as
-  // `_id` or `id` depending on which code path last wrote it.
   const myId = String(rawMe._id || rawMe.id || "");
   const myEmail = rawMe.email || "";
 
   const EMOJIS = ["👍", "❤️", "😂", "🎉", "🔥", "😮", "😢", "🙏"];
 
+  // ── Mount: connect socket, load groups + users ─────────────────────────────
   useEffect(() => {
     axios
       .get(`${API_BASE}/api/sessions`)
@@ -45,15 +46,22 @@ export default function Chatroom() {
 
     const s = createSocket(token);
     socketRef.current = s;
-    s.connect();
 
-    if (myEmail) s.emit("register", { email: myEmail });
+    s.on("connect", () => {
+      // FIX: register and set socketReady AFTER the socket is actually
+      // connected, not before. Previously `register` was emitted right after
+      // s.connect() while the handshake was still in flight.
+      if (myEmail) s.emit("register", { email: myEmail });
+      setSocketReady(true);
+    });
+
+    s.on("disconnect", () => setSocketReady(false));
+    s.on("connect_error", (err) => console.error("Socket error:", err.message));
 
     s.on("message", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
         setSessionMessages((prev) => {
-          // deduplicate — socket and HTTP response can both deliver the message
           if (prev.some((x) => x._id === m._id)) return prev;
           return [...prev, m];
         });
@@ -63,18 +71,14 @@ export default function Chatroom() {
     s.on("messageEdited", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
-        setSessionMessages((prev) =>
-          prev.map((x) => (x._id === m._id ? m : x))
-        );
+        setSessionMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
       }
     });
 
     s.on("messageReacted", (m) => {
       const sel = selectedGroupRef.current;
       if (sel && m.room === `session:${sel._id}`) {
-        setSessionMessages((prev) =>
-          prev.map((x) => (x._id === m._id ? m : x))
-        );
+        setSessionMessages((prev) => prev.map((x) => (x._id === m._id ? m : x)));
       }
     });
 
@@ -88,11 +92,14 @@ export default function Chatroom() {
       });
     });
 
+    s.connect();
+
     return () => {
       try { s.disconnect(); } catch {}
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Selected session: join room + load history ─────────────────────────────
   useEffect(() => {
     const s = socketRef.current;
     selectedGroupRef.current = selectedGroup;
@@ -102,27 +109,46 @@ export default function Chatroom() {
       return;
     }
 
+    const room = `session:${selectedGroup._id}`;
+
+    // FIX: if the socket isn't connected yet when the group is selected
+    // (e.g. user clicks quickly on page load), queue the joinRoom for when
+    // it does connect instead of silently dropping it.
+    const doJoin = () => s.emit("joinRoom", { roomId: room });
+    if (s?.connected) {
+      doJoin();
+    } else {
+      s?.once("connect", doJoin);
+    }
+
+    // FIX: AbortController prevents a slow session-history response from
+    // overwriting messages if the user switches groups before it resolves.
+    const abort = new AbortController();
+
     axios
       .get(`${API_BASE}/api/messages/session/${selectedGroup._id}`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: abort.signal,
       })
       .then((res) => setSessionMessages(res.data || []))
-      .catch(() => setSessionMessages([]));
-
-    const room = `session:${selectedGroup._id}`;
-    if (s?.connected) s.emit("joinRoom", { roomId: room });
+      .catch((err) => {
+        if (axios.isCancel(err) || err.name === "CanceledError") return;
+        setSessionMessages([]);
+      });
 
     return () => {
+      abort.abort();
+      s?.off("connect", doJoin); // remove queued join if it never fired
       if (s?.connected) s.emit("leaveRoom", { roomId: room });
       setSessionMessages([]);
       selectedGroupRef.current = null;
     };
   }, [selectedGroup]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Helpers ────────────────────────────────────────────────────────────────
   const sendTyping = (roomId, isTyping) => {
     const s = socketRef.current;
     if (!s?.connected) return;
-    // use normalised myId so the typing filter on the receiver side matches
     s.emit("typing", { roomId, user: myEmail || myId, isTyping });
   };
 
@@ -162,9 +188,7 @@ export default function Chatroom() {
         { text: newText },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
 
   const reactToMessage = async (msgId, emoji) => {
@@ -186,15 +210,11 @@ export default function Chatroom() {
     return u ? u.name || u.email : email;
   };
 
-  // BUG FIX 2: the old version compared `m.from._id` against `me._id` which
-  // could be undefined, making `isMsgFromMe` always return false and sending
-  // the wrong CSS class to every session message. Now uses `myId` and `myEmail`
-  // both of which are safely normalised above.
   const isMsgFromMe = (m) => {
     if (!m?.from) return false;
     const fromId = String(m.from._id || m.from);
     const fromEmail = m.from.email;
-    if (fromId && myId) return fromId === myId;
+    if (fromId && myId && fromId !== "undefined") return fromId === myId;
     if (fromEmail && myEmail) return fromEmail === myEmail;
     return false;
   };
@@ -205,11 +225,10 @@ export default function Chatroom() {
     const keys = Object.keys(m).filter((e) => e && e !== myEmail && e !== myId);
     if (!keys.length) return null;
     const names = keys.map((k) => getDisplayNameForEmail(k));
-    return names.length === 1
-      ? `${names[0]} is typing...`
-      : "Multiple people are typing...";
+    return names.length === 1 ? `${names[0]} is typing...` : "Multiple people are typing...";
   };
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="app-shell chatroom-container">
       <div className="chatroom-shell">
@@ -219,10 +238,7 @@ export default function Chatroom() {
             <div
               key={g._id}
               className="group"
-              onClick={() => {
-                setDmUser(null);        // close any open DM when switching to session
-                setSelectedGroup(g);
-              }}
+              onClick={() => { setDmUser(null); setSelectedGroup(g); }}
             >
               {g.title || g.name || g._id}
             </div>
@@ -237,10 +253,7 @@ export default function Chatroom() {
               <div
                 key={u._id}
                 className="group"
-                onClick={() => {
-                  setSelectedGroup(null);   // close any open session when opening DM
-                  setDmUser(u);
-                }}
+                onClick={() => { setSelectedGroup(null); setDmUser(u); }}
               >
                 {u.name || u.email}
               </div>
@@ -248,8 +261,18 @@ export default function Chatroom() {
         </div>
 
         <div className="right">
-          {dmUser ? (
-            <PrivateChat otherUser={dmUser} onClose={() => setDmUser(null)} />
+          {dmUser && socketReady ? (
+            // FIX: pass the shared socket down so PrivateChat reuses the
+            // already-connected socket instead of creating a new one on every
+            // mount. This is why DM messages weren't persistent — a brand-new
+            // socket on every mount meant a fresh connection race on every
+            // user switch, and on Render's free tier that's 300–800ms of
+            // dead time where messages and history fetches could go missing.
+            <PrivateChat
+              otherUser={dmUser}
+              socket={socketRef.current}
+              onClose={() => setDmUser(null)}
+            />
           ) : selectedGroup ? (
             <>
               <h3>{selectedGroup.title || selectedGroup.name}</h3>
@@ -258,13 +281,9 @@ export default function Chatroom() {
                 {sessionMessages.map((m) => {
                   const amI = isMsgFromMe(m);
                   return (
-                    <div
-                      key={m._id || m.createdAt}
-                      className={`msg ${amI ? "me" : ""}`}
-                    >
+                    <div key={m._id || m.createdAt} className={`msg ${amI ? "me" : ""}`}>
                       <div style={{ fontSize: 12, opacity: 0.8 }}>
-                        {m.from?.name || m.from?.email}{" "}
-                        {m.edited ? "(edited)" : ""}
+                        {m.from?.name || m.from?.email} {m.edited ? "(edited)" : ""}
                       </div>
 
                       <div>{m.text}</div>
@@ -272,11 +291,7 @@ export default function Chatroom() {
                       {m.attachments?.map((a, i) => (
                         <div key={i}>
                           {a.mime?.startsWith("image/") ? (
-                            <img
-                              src={a.url}
-                              alt={a.name}
-                              style={{ maxWidth: 200 }}
-                            />
+                            <img src={a.url} alt={a.name} style={{ maxWidth: 200 }} />
                           ) : (
                             <a href={a.url} target="_blank" rel="noreferrer">
                               {a.name || "attachment"}
@@ -287,25 +302,17 @@ export default function Chatroom() {
 
                       <div style={{ fontSize: 12, opacity: 0.7 }}>
                         {m.reactions?.map((r, idx) => (
-                          <span key={idx} style={{ marginRight: 6 }}>
-                            {r.emoji}
-                          </span>
+                          <span key={idx} style={{ marginRight: 6 }}>{r.emoji}</span>
                         ))}
 
-                        <button onClick={() => reactToMessage(m._id, "👍")}>
-                          👍
-                        </button>
-
-                        <button onClick={() => setShowEmojiMenuFor(m._id)}>
-                          😀
-                        </button>
+                        <button onClick={() => reactToMessage(m._id, "👍")}>👍</button>
+                        <button onClick={() => setShowEmojiMenuFor(m._id)}>😀</button>
 
                         {amI && (
                           <button
                             onClick={() => {
                               const newText = prompt("Edit message", m.text);
-                              if (newText !== null)
-                                editMessage(m._id, newText);
+                              if (newText !== null) editMessage(m._id, newText);
                             }}
                           >
                             Edit
@@ -315,11 +322,7 @@ export default function Chatroom() {
                         {showEmojiMenuFor === m._id && (
                           <div style={{ display: "inline-block", marginLeft: 8 }}>
                             {EMOJIS.map((e) => (
-                              <button
-                                key={e}
-                                onClick={() => reactToMessage(m._id, e)}
-                                style={{ marginRight: 6 }}
-                              >
+                              <button key={e} onClick={() => reactToMessage(m._id, e)} style={{ marginRight: 6 }}>
                                 {e}
                               </button>
                             ))}
@@ -347,25 +350,9 @@ export default function Chatroom() {
                 <div style={{ position: "relative" }}>
                   <button onClick={() => setShowEmojiMenuFor("send")}>😀</button>
                   {showEmojiMenuFor === "send" && (
-                    <div
-                      style={{
-                        position: "absolute",
-                        right: 0,
-                        top: "40px",
-                        background: "#fff",
-                        padding: 8,
-                        borderRadius: 8,
-                      }}
-                    >
+                    <div style={{ position: "absolute", right: 0, top: "40px", background: "#fff", padding: 8, borderRadius: 8 }}>
                       {EMOJIS.map((e) => (
-                        <button
-                          key={e}
-                          onClick={() => {
-                            sendSessionMsg(e);
-                            setShowEmojiMenuFor(null);
-                          }}
-                          style={{ marginRight: 6 }}
-                        >
+                        <button key={e} onClick={() => { sendSessionMsg(e); setShowEmojiMenuFor(null); }} style={{ marginRight: 6 }}>
                           {e}
                         </button>
                       ))}

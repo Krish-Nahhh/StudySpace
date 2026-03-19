@@ -27,13 +27,10 @@ app.get("/", (req, res) => {
   res.send("StudySpace backend running");
 });
 
-// static uploads
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// make socket available in routes
 app.set("io", io);
 
-// route mounts
 app.use('/api/auth', authRoutes);
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/messages', messageRoutes);
@@ -57,34 +54,38 @@ io.use((socket, next) => {
   }
 });
 
+// Helper: check if the authenticated socket user is a party in a DM room.
+// roomId format: "dm:<sortedId1>:<sortedId2>"
+function canAccessDmRoom(socket, roomId) {
+  if (!roomId.startsWith('dm:')) return true; // not a DM room, allow
+  const parts = roomId.split(':');
+  if (parts.length !== 3) return false;
+  const currentUserId = String(socket.user?.id || "");
+  return currentUserId === parts[1] || currentUserId === parts[2];
+}
+
 // SOCKET.IO
 io.on('connection', (socket) => {
-  console.log("Socket connected:", socket.id);
-
-  // auto join personal room
-  if (socket.user?.id) {
-    socket.join(`user:${socket.user.id}`);
+  // BUG FIX: guard against auth middleware not having set socket.user
+  if (!socket.user?.id) {
+    console.warn("Socket connected without valid user, disconnecting:", socket.id);
+    socket.disconnect(true);
+    return;
   }
+
+  console.log("Socket connected:", socket.id, "user:", socket.user.email);
+
+  // Auto-join personal room for targeted notifications
+  socket.join(`user:${socket.user.id}`);
 
   socket.on('joinRoom', ({ roomId }) => {
     if (!roomId) return;
-    
-    // Validate DM room access - only users in the DM can join
-    if (roomId.startsWith('dm:')) {
-      const parts = roomId.split(':');
-      if (parts.length === 3) {
-        const userId1 = parts[1];
-        const userId2 = parts[2];
-        const currentUserId = String(socket.user.id);
-        
-        // Only allow join if user is one of the two parties
-        if (currentUserId !== userId1 && currentUserId !== userId2) {
-          console.warn(`Unauthorized attempt to join room ${roomId} by user ${currentUserId}`);
-          return;
-        }
-      }
+
+    if (!canAccessDmRoom(socket, roomId)) {
+      console.warn(`Unauthorized joinRoom attempt: room=${roomId} user=${socket.user.id}`);
+      return;
     }
-    
+
     socket.join(roomId);
   });
 
@@ -94,61 +95,35 @@ io.on('connection', (socket) => {
 
   socket.on("typing", ({ roomId, user, isTyping }) => {
     if (!roomId) return;
-    
-    // Validate user can send typing in this room
-    if (roomId.startsWith('dm:')) {
-      const parts = roomId.split(':');
-      if (parts.length === 3) {
-        const userId1 = parts[1];
-        const userId2 = parts[2];
-        const currentUserId = String(socket.user.id);
-        if (currentUserId !== userId1 && currentUserId !== userId2) {
-          console.warn(`Unauthorized typing in room ${roomId}`);
-          return;
-        }
-      }
+
+    if (!canAccessDmRoom(socket, roomId)) {
+      console.warn(`Unauthorized typing attempt: room=${roomId} user=${socket.user.id}`);
+      return;
     }
-    
+
+    // Emit to everyone in the room EXCEPT the sender
     socket.to(roomId).emit("typing", { user, isTyping, roomId });
   });
 
   socket.on("editMessage", (msg) => {
-    if (!msg.room) return;
-    
-    // Validate user can edit in this room
-    if (msg.room.startsWith('dm:')) {
-      const parts = msg.room.split(':');
-      if (parts.length === 3) {
-        const userId1 = parts[1];
-        const userId2 = parts[2];
-        const currentUserId = String(socket.user.id);
-        if (currentUserId !== userId1 && currentUserId !== userId2) {
-          console.warn(`Unauthorized edit in room ${msg.room}`);
-          return;
-        }
-      }
+    if (!msg?.room) return;
+
+    if (!canAccessDmRoom(socket, msg.room)) {
+      console.warn(`Unauthorized editMessage attempt: room=${msg.room} user=${socket.user.id}`);
+      return;
     }
-    
+
     io.to(msg.room).emit("messageEdited", msg);
   });
 
   socket.on("reactMessage", (msg) => {
-    if (!msg.room) return;
-    
-    // Validate user can react in this room
-    if (msg.room.startsWith('dm:')) {
-      const parts = msg.room.split(':');
-      if (parts.length === 3) {
-        const userId1 = parts[1];
-        const userId2 = parts[2];
-        const currentUserId = String(socket.user.id);
-        if (currentUserId !== userId1 && currentUserId !== userId2) {
-          console.warn(`Unauthorized reaction in room ${msg.room}`);
-          return;
-        }
-      }
+    if (!msg?.room) return;
+
+    if (!canAccessDmRoom(socket, msg.room)) {
+      console.warn(`Unauthorized reactMessage attempt: room=${msg.room} user=${socket.user.id}`);
+      return;
     }
-    
+
     io.to(msg.room).emit("messageReacted", msg);
   });
 
@@ -158,7 +133,7 @@ io.on('connection', (socket) => {
 });
 
 // SERVER
-const PORT = process.env.PORT || 5000; // FINAL BACKEND PORT
+const PORT = process.env.PORT || 5000;
 const MONGO = process.env.MONGO_URI;
 
 mongoose.connect(MONGO, {
